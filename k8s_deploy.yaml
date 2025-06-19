@@ -1,0 +1,110 @@
+---
+# 📦 PVC - 儲存模型權重（ReadWriteOnce）範本（每個 Pod 會有一個）
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: llm-models-pvc-0  # 若需多副本請手動建立 llm-models-pvc-1, pvc-2...
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+---
+# 🚀 StatefulSet - 每個 Pod 都有自己的 PVC
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llm-stack
+spec:
+  serviceName: llm-gateway-svc
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-stack
+  template:
+    metadata:
+      labels:
+        app: llm-stack
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: llm
+                    operator: In
+                    values:
+                      - "true"
+      containers:
+        - name: gateway
+          image: youracr.azurecr.io/llm-gateway:latest
+          env:
+            - name: TGI_HOST
+              value: "http://localhost:8080"
+          ports:
+            - containerPort: 3000
+          volumeMounts:
+            - name: models
+              mountPath: /models
+        - name: tgi
+          image: ghcr.io/huggingface/text-generation-inference:1.4.0
+          args:
+            - "--model-id"
+            - "/models/Qwen_Qwen3-4B"
+            - "--port"
+            - "8080"
+            - "--max-total-tokens"
+            - "2048"
+            - "--dtype"
+            - "bfloat16"
+          volumeMounts:
+            - name: models
+              mountPath: /models
+          resources:
+            requests:
+              cpu: "4"
+              memory: "10Gi"
+            limits:
+              cpu: "8"
+              memory: "20Gi"
+  volumeClaimTemplates:
+    - metadata:
+        name: models
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 50Gi
+---
+# 🌐 Service - 對外提供 HTTP 端口（由 gateway 對外）
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-gateway-svc
+spec:
+  clusterIP: None
+  selector:
+    app: llm-stack
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 3000
+---
+# 🌍 Ingress - 提供 Web API 存取（需搭配 Ingress Controller）
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-gateway-ingress
+spec:
+  rules:
+    - host: llm.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: llm-gateway-svc
+                port:
+                  number: 80

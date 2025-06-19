@@ -1,0 +1,177 @@
+---
+# 📦 PVC - 範本：每個 Pod 會自動有獨立的 PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: llm-models-pvc-0  # 僅示意，StatefulSet 會自動產生
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+---
+# 🚀 StatefulSet - 每個 Pod 掛載獨立 PVC 並載入不同模型
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: llm-stack
+spec:
+  serviceName: llm-gateway-svc
+  replicas: 3
+  selector:
+    matchLabels:
+      app: llm-stack
+  template:
+    metadata:
+      labels:
+        app: llm-stack
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: llm
+                    operator: In
+                    values:
+                      - "true"
+      containers:
+        - name: gateway
+          image: youracr.azurecr.io/llm-gateway:latest
+          env:
+            - name: TGI_HOST
+              value: "http://localhost:8080"
+            - name: MODEL_LIST
+              value: >-
+                Qwen/Qwen3-4B, mistralai/Mistral-7B-Instruct, meta-llama/Llama-2-7b-chat-hf
+            - name: POD_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          ports:
+            - containerPort: 3000
+          volumeMounts:
+            - name: models
+              mountPath: /models
+        - name: tgi
+          image: ghcr.io/huggingface/text-generation-inference:1.4.0
+          command: ["sh", "-c"]
+          args:
+            - |
+              INDEX=$(echo $POD_INDEX | rev | cut -d'-' -f1 | rev);
+              MODEL_ID=$(echo $MODEL_LIST | cut -d',' -f$((INDEX+1)) | xargs);
+              LOCAL_PATH="/models/$(echo $MODEL_ID | sed 's|/|_|g')";
+              text-generation-launcher --model-id $LOCAL_PATH --port 8080 --max-total-tokens 2048 --dtype bfloat16
+          env:
+            - name: MODEL_LIST
+              value: >-
+                Qwen/Qwen3-4B, mistralai/Mistral-7B-Instruct, meta-llama/Llama-2-7b-chat-hf
+            - name: POD_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: models
+              mountPath: /models
+          resources:
+            requests:
+              cpu: "4"
+              memory: "10Gi"
+            limits:
+              cpu: "8"
+              memory: "20Gi"
+  volumeClaimTemplates:
+    - metadata:
+        name: models
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 50Gi
+---
+# 🌐 Service - 對應 StatefulSet Headless Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-gateway-svc
+spec:
+  clusterIP: None
+  selector:
+    app: llm-stack
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 3000
+---
+# 🌍 Ingress - 對外入口
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-gateway-ingress
+spec:
+  rules:
+    - host: llm.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: llm-gateway-svc
+                port:
+                  number: 80
+---
+# 🐳 Dockerfile - FastAPI Gateway
+FROM python:3.10-slim
+
+RUN pip install --no-cache-dir fastapi uvicorn httpx \
+ && pip install huggingface_hub
+
+WORKDIR /app
+COPY app /app
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "3000"]
+---
+# 📄 requirements.txt
+fastapi
+uvicorn
+httpx
+huggingface_hub
+---
+# 🧠 main.py - FastAPI app（自動選模型）
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+import httpx, os, subprocess, pathlib
+
+app = FastAPI()
+
+MODEL_LIST = os.getenv("MODEL_LIST", "").split(",")
+POD_NAME = os.getenv("POD_INDEX", "llm-stack-0")
+INDEX = int(POD_NAME.split("-")[-1])
+CURRENT_MODEL = MODEL_LIST[INDEX].strip()
+MODEL_DIR = pathlib.Path("/models")
+MODEL_PATH = MODEL_DIR / CURRENT_MODEL.replace("/", "_")
+
+@app.get("/admin/models")
+def list_models():
+    return [p.name for p in MODEL_DIR.iterdir() if p.is_dir()]
+
+@app.post("/admin/download")
+def download_model():
+    if MODEL_PATH.exists():
+        return {"msg": f"{CURRENT_MODEL} 已存在"}
+    subprocess.run([
+        "huggingface-cli", "snapshot", CURRENT_MODEL, "--local-dir", str(MODEL_PATH)
+    ], check=True)
+    return {"msg": f"{CURRENT_MODEL} 已下載"}
+
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "OPTIONS"])
+async def proxy_to_tgi(path: str, request: Request):
+    async with httpx.AsyncClient(timeout=None) as client:
+        response = await client.request(
+            method=request.method,
+            url=f"http://localhost:8080/v1/{path}",
+            headers={k: v for k, v in request.headers.items() if k.lower() != "host"},
+            content=await request.body()
+        )
+        return StreamingResponse(response.aiter_raw(), status_code=response.status_code)
