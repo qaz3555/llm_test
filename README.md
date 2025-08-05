@@ -25,3 +25,13 @@ grep -rIl "3.8.3" /usr /usr/local /opt 2>/dev/null \
       fi
     done
 ```
+
+```
+grep -rIl "3.8.3" /usr /usr/local /opt 2>/dev/null \
+  | grep -E '\.(py|txt|ini|conf|rst|cmake|pc|h|METADATA|PKG-INFO)$' \
+  | while read -r file; do \
+      if file "$file" | grep -q "text"; then
+        sed -i 's/3\.8\.3/3.8.X/g' "$file"
+      fi
+    done
+```
