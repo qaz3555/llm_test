@@ -16,3 +16,12 @@ RUN for dir in /usr/lib /usr/share /usr/include /usr/local; do \
         done; \
     done
 ```
+
+```
+grep -rIl "3.8.3" /usr /usr/local /opt 2>/dev/null \
+  | while read -r file; do \
+      if file "$file" | grep -q "text"; then
+        echo "$file"
+      fi
+    done
+```
